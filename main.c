@@ -37,19 +37,32 @@ static GtkWidget *compress_button;
 
 static char *selected_file = NULL;
 static long long selected_size = 0;
-static int selected_level = 1;
+static int selected_level = 1; // default medium
 static int estimation_id = 0;
 static gboolean compressing = FALSE;
 static gboolean shutting_down = FALSE;
 
-static const char *pdf_settings[3] = {"/prepress", "/ebook", "/screen"}; 
+/* Order corresponds to UI labels: Baixa (low), Média (medium), Alta (high) */
+static const char *pdf_settings[3] = {"/screen", "/ebook", "/prepress"};
 
 static char *output_dir = NULL;
 
 extern char **environ;
 
+/*
+ * Busca o executável Ghostscript (gs).
+ *
+ * Quando a aplicação é iniciada como um bundle macOS, o PATH padrão pode não
+ * incluir o diretório onde o Homebrew instala o gs (/opt/homebrew/bin ou
+ * /usr/local/bin). Esta função tenta localizar o executável nas seguintes fontes:
+ *   1. O PATH corrente (g_find_program_in_path).
+ *   2. Diretórios típicos de instalação do Homebrew.
+ *   3. A Cellar do Homebrew, caso o gs tenha sido instalado em um sub‑diretório.
+ * Se nenhum desses locais contiver um binário executável, a função devolve NULL.
+ */
 static char *find_gs(void)
 {
+    /* 1. Busca no PATH corrente */
     gchar *found = g_find_program_in_path("gs");
     if (found) {
         if (access(found, X_OK) == 0) {
@@ -60,6 +73,7 @@ static char *find_gs(void)
         g_free(found);
     }
 
+    /* 2. Diretórios padrão do Homebrew */
     const char *candidates[] = {
         "/opt/homebrew/bin/gs",
         "/usr/local/bin/gs",
@@ -70,6 +84,7 @@ static char *find_gs(void)
         }
     }
 
+    /* 3. Busca na Cellar do Homebrew */
     glob_t gl;
     if (glob("/opt/homebrew/Cellar/ghostscript/*/bin/gs", 0, NULL, &gl) == 0 && gl.gl_pathc > 0) {
         const char *path = gl.gl_pathv[0];
@@ -91,6 +106,9 @@ static int run_gs(const char *gs_path,
                   char *errbuf,
                   size_t errbuf_size)
 {
+    /* Monta os parâmetros de forma idempotente – cada argumento é uma string
+     * independente, assim o posix_spawnp não tem que analisar espaços ou aspas.
+     */
     char setting_arg[256];
     snprintf(setting_arg, sizeof(setting_arg), "-dPDFSETTINGS=%s", setting);
     char output_arg[4096];
@@ -108,16 +126,45 @@ static int run_gs(const char *gs_path,
     argv[7] = (char *)input;
     argv[8] = NULL;
 
-    pid_t pid;
-    int status;
-    int err;
-
-    err = posix_spawnp(&pid, gs_path, NULL, NULL, argv, environ);
-    free(argv);
-    if (err != 0) {
-        snprintf(errbuf, errbuf_size, "Failed to start gs: %s", strerror(err));
+    /* Captura stderr do Ghostscript para apresentar mensagens ao usuário. */
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        snprintf(errbuf, errbuf_size, "pipe failed: %s", strerror(errno));
+        free(argv);
         return -1;
     }
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    /* Redireciona o descritor 2 (stderr) para o lado de escrita do pipe */
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
+    /* Fecha o lado de leitura no filho – ele não o usa */
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+    /* Fecha o lado de escrita no filho após o dup2 */
+    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+    pid_t pid;
+    int status;
+    int err = posix_spawnp(&pid, gs_path, &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    free(argv);
+    close(pipefd[1]); /* Fechar escrita no processo pai */
+
+    if (err != 0) {
+        snprintf(errbuf, errbuf_size, "Failed to start gs: %s", strerror(err));
+        close(pipefd[0]);
+        return -1;
+    }
+
+    /* Lê a saída de erro completa do Ghostscript */
+    ssize_t total = 0;
+    while (total < (ssize_t)errbuf_size - 1) {
+        ssize_t r = read(pipefd[0], errbuf + total, errbuf_size - 1 - total);
+        if (r <= 0) break;
+        total += r;
+    }
+    errbuf[total] = '\0';
+    close(pipefd[0]);
 
     if (waitpid(pid, &status, 0) == -1) {
         snprintf(errbuf, errbuf_size, "waitpid failed: %s", strerror(errno));
@@ -131,16 +178,36 @@ static int run_gs(const char *gs_path,
 
     int exit_code = WEXITSTATUS(status);
     if (exit_code != 0) {
-        snprintf(errbuf, errbuf_size, "gs exited with status %d", exit_code);
+        if (errbuf[0] == '\0') {
+            snprintf(errbuf, errbuf_size, "gs exited with status %d", exit_code);
+        }
         return -1;
     }
 
     return 0;
 }
 
+/* Helper that wraps find_gs + run_gs and returns a textual error if any */
+static int run_ghostscript(const char *input, const char *output, const char *setting, char **err_msg_out)
+{
+    char *gs_path = find_gs();
+    if (!gs_path) {
+        *err_msg_out = g_strdup("Ghostscript (gs) not found. Install with: brew install ghostscript");
+        return -1;
+    }
+    char errbuf[1024] = {0};
+    int rc = run_gs(gs_path, input, output, setting, errbuf, sizeof(errbuf));
+    g_free(gs_path);
+    if (rc != 0) {
+        *err_msg_out = g_strdup(errbuf);
+        return -1;
+    }
+    *err_msg_out = NULL;
+    return 0;
+}
+
 static gboolean update_estimate_ui(gpointer data)
 {
-
     if (shutting_down)
         return G_SOURCE_REMOVE;
 
@@ -159,9 +226,9 @@ static gboolean update_estimate_ui(gpointer data)
     if (selected_size > 0) {
         double ratio = (double)est_size / (double)selected_size;
         double perc = (1.0 - ratio) * 100.0;
-        snprintf(buf, sizeof(buf), "Reduction estimada: %.0f%%", perc);
+        snprintf(buf, sizeof(buf), "Redução estimada: %.0f%%", perc);
     } else {
-        snprintf(buf, sizeof(buf), "Reduction estimada: N/A");
+        snprintf(buf, sizeof(buf), "Redução estimada: N/A");
     }
     gtk_label_set_text(GTK_LABEL(reduction_label), buf);
 
@@ -193,24 +260,13 @@ static gpointer estimation_thread_func(gpointer user_data)
     close(fd);
     unlink(tmpl);
 
-    char *gs_path = find_gs();
-    if (!gs_path) {
-        char *msg = g_strdup("Ghostscript (gs) not found. Install with: brew install ghostscript");
+    char *err_msg = NULL;
+    if (run_ghostscript(req->input_path, tmpl, req->setting, &err_msg) != 0) {
+        char *msg = g_strdup_printf("Erro na simulação: %s", err_msg ? err_msg : "unknown");
         g_idle_add_full(G_PRIORITY_DEFAULT, set_label_error, msg, g_free);
-        g_free(tmpl);
-        g_free(req->input_path);
-        g_free(req->setting);
-        g_free(req);
-        return NULL;
-    }
-
-    char errbuf[1024] = {0};
-    if (run_gs(gs_path, req->input_path, tmpl, req->setting, errbuf, sizeof(errbuf)) != 0) {
-        char *msg = g_strdup_printf("Erro na simulation: %s", errbuf);
-        g_idle_add_full(G_PRIORITY_DEFAULT, set_label_error, msg, g_free);
+        g_free(err_msg);
         unlink(tmpl);
         g_free(tmpl);
-        g_free(gs_path);
         g_free(req->input_path);
         g_free(req->setting);
         g_free(req);
@@ -223,7 +279,6 @@ static gpointer estimation_thread_func(gpointer user_data)
         g_idle_add_full(G_PRIORITY_DEFAULT, set_label_error, msg, g_free);
         unlink(tmpl);
         g_free(tmpl);
-        g_free(gs_path);
         g_free(req->input_path);
         g_free(req->setting);
         g_free(req);
@@ -233,7 +288,6 @@ static gpointer estimation_thread_func(gpointer user_data)
     req->est_size = st.st_size;
     unlink(tmpl);
     g_free(tmpl);
-    g_free(gs_path);
 
     EstimateResult *result = g_new0(EstimateResult, 1);
     result->request_id = req->request_id;
@@ -259,8 +313,8 @@ static void start_estimation(void)
     req->request_id = estimation_id;
     req->est_size = 0;
 
-    gtk_label_set_text(GTK_LABEL(estimate_label), "Calculating estimativa...");
-    gtk_label_set_text(GTK_LABEL(reduction_label), "Reduction estimada: N/A");
+    gtk_label_set_text(GTK_LABEL(estimate_label), "Calculando estimativa...");
+    gtk_label_set_text(GTK_LABEL(reduction_label), "Redução estimada: N/A");
 
     GThread *thr = g_thread_new("estimate", estimation_thread_func, req);
     g_thread_unref(thr);
@@ -285,7 +339,7 @@ static gboolean update_compress_ui(gpointer data)
 
     compressing = FALSE;
     gtk_widget_set_sensitive(compress_button, TRUE);
-    gtk_button_set_label(GTK_BUTTON(compress_button), "Compress PDF");
+    gtk_button_set_label(GTK_BUTTON(compress_button), "Comprimir PDF");
 
     if (result_msg) {
         GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL,
@@ -314,15 +368,8 @@ static gpointer compression_thread_func(gpointer user_data)
 {
     CompressionRequest *req = (CompressionRequest *)user_data;
 
-    char *gs_path = find_gs();
-    char errbuf[1024] = {0};
-    int rc = -1;
-    if (gs_path) {
-        rc = run_gs(gs_path, req->input_path, req->output_path, req->setting, errbuf, sizeof(errbuf));
-        g_free(gs_path);
-    } else {
-        snprintf(errbuf, sizeof(errbuf), "Ghostscript (gs) not found. Install with: brew install ghostscript");
-    }
+    char *err_msg = NULL;
+    int rc = run_ghostscript(req->input_path, req->output_path, req->setting, &err_msg);
 
     CompressionRequest *result = (CompressionRequest *)malloc(sizeof(CompressionRequest));
     result->input_path = NULL;
@@ -331,12 +378,12 @@ static gpointer compression_thread_func(gpointer user_data)
     if (rc == 0) {
         result->result_msg = g_strdup_printf("Compressão concluída:\n%s", req->output_path);
     } else {
-        result->result_msg = g_strdup_printf("Falha ao comprimir: %s", errbuf);
+        result->result_msg = g_strdup_printf("Falha ao comprimir: %s", err_msg ? err_msg : "unknown");
+        g_free(err_msg);
     }
     g_free(req->input_path);
     g_free(req->output_path);
     g_free(req->setting);
-    g_free(req->result_msg);
     g_free(req);
 
     g_idle_add(update_compress_ui, result);
@@ -376,7 +423,7 @@ static void on_compress_clicked(GtkButton *button, gpointer user_data)
     do {
         g_string_truncate(suffix, 0);
         g_string_append(suffix, output_dir);
-        g_string_append(suffix, "/");
+        g_string_append_c(suffix, '/');
         g_string_append(suffix, name);
         g_string_append(suffix, "_compressed");
         if (i > 0) {
@@ -387,7 +434,6 @@ static void on_compress_clicked(GtkButton *button, gpointer user_data)
         i++;
     } while (g_file_test(out_path, G_FILE_TEST_EXISTS));
     g_string_free(suffix, TRUE);
-
     g_free(name);
 
     compressing = TRUE;
@@ -417,7 +463,7 @@ static void on_select_file_clicked(GtkButton *button, gpointer user_data)
     (void)button;
     (void)user_data;
     GtkFileChooserNative *chooser = gtk_file_chooser_native_new(
-        "Select PDF", NULL, GTK_FILE_CHOOSER_ACTION_OPEN, "Open", "Cancel");
+        "Selecionar PDF", NULL, GTK_FILE_CHOOSER_ACTION_OPEN, "Abrir", "Cancelar");
 
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_set_name(filter, "PDF files");
@@ -457,8 +503,81 @@ static void on_select_file_clicked(GtkButton *button, gpointer user_data)
 
 int main(int argc, char *argv[])
 {
-    output_dir = "/Users/everton/pdfcompressor/compressed";
-    g_mkdir_with_parents(output_dir, -1);
+    /* Determine a writable output directory.
+     *
+     * Quando o programa é iniciado a partir de um bundle macOS (.app) o diretório
+     * de trabalho pode ser "/" – o que faria "compressed" ser resolvido como
+     * "/compressed", diretório não gravável. Para evitar isso usamos o diretório
+     * onde o executável está localizado (argv[0]) como base, criando
+     * "<exe_dir>/compressed". Assim o caminho de saída funciona tanto em
+     * modo‑linha‑de‑comando quanto na interface gráfica empacotada.
+     */
+    /* Prefer a user‑writable directory (home) to evitar problemas ao escrever
+     * dentro do bundle da aplicação, que pode estar em /Applications e ser
+     * somente leitura. Usamos "$HOME/pdfcompressor/compressed" como local padrão.
+     */
+    const char *home = g_get_home_dir();
+    output_dir = g_build_filename(home, "pdfcompressor", "compressed", NULL);
+    g_mkdir_with_parents(output_dir, 0755);
+
+    /* CLI mode: if an input file is supplied, compress directly and exit */
+    if (argc > 1) {
+        const char *input_path = argv[1];
+        int level = 1; // medium default
+        if (argc > 2 && strcmp(argv[2], "--level") == 0 && argc > 3) {
+            const char *lvl = argv[3];
+            if (strcmp(lvl, "low") == 0) level = 0;
+            else if (strcmp(lvl, "medium") == 0) level = 1;
+            else if (strcmp(lvl, "high") == 0) level = 2;
+            else {
+                fprintf(stderr, "Nível desconhecido: %s\n", lvl);
+                return 1;
+            }
+        }
+
+        // Build output file name like the GUI
+        char *basename = g_path_get_basename(input_path);
+        char *name = NULL;
+        if (g_str_has_suffix(basename, ".pdf")) {
+            size_t len = strlen(basename) - 4;
+            name = g_strndup(basename, len);
+        } else {
+            name = g_strdup(basename);
+        }
+        g_free(basename);
+
+        char *out_path = NULL;
+        int i = 0;
+        GString *suffix = g_string_new("");
+        do {
+            g_string_truncate(suffix, 0);
+            g_string_append(suffix, output_dir);
+            g_string_append_c(suffix, '/');
+            g_string_append(suffix, name);
+            g_string_append(suffix, "_compressed");
+            if (i > 0) {
+                g_string_append_printf(suffix, "_%d", i);
+            }
+            g_string_append(suffix, ".pdf");
+            out_path = g_strdup(suffix->str);
+            i++;
+        } while (g_file_test(out_path, G_FILE_TEST_EXISTS));
+        g_string_free(suffix, TRUE);
+        g_free(name);
+
+        char *err_msg = NULL;
+        int rc = run_ghostscript(input_path, out_path, pdf_settings[level], &err_msg);
+        if (rc == 0) {
+            printf("Compressão concluída: %s\n", out_path);
+        } else {
+            fprintf(stderr, "Falha ao comprimir: %s\n", err_msg ? err_msg : "unknown");
+            g_free(err_msg);
+            g_free(out_path);
+            return 1;
+        }
+        g_free(out_path);
+        return 0;
+    }
 
     gtk_init(&argc, &argv);
 
@@ -472,7 +591,7 @@ int main(int argc, char *argv[])
     gtk_grid_set_column_spacing(GTK_GRID(grid), 5);
     gtk_container_add(GTK_CONTAINER(window), grid);
 
-    GtkWidget *select_btn = gtk_button_new_with_label("Select PDF");
+    GtkWidget *select_btn = gtk_button_new_with_label("Selecionar PDF");
     g_signal_connect(select_btn, "clicked", G_CALLBACK(on_select_file_clicked), NULL);
     gtk_grid_attach(GTK_GRID(grid), select_btn, 0, 0, 1, 1);
 
@@ -483,9 +602,9 @@ int main(int argc, char *argv[])
     gtk_grid_attach(GTK_GRID(grid), size_label, 1, 1, 1, 1);
 
     level_combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level_combo), "Low");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level_combo), "Medium");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level_combo), "High");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level_combo), "Baixa");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level_combo), "Média");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level_combo), "Alta");
     gtk_combo_box_set_active(GTK_COMBO_BOX(level_combo), 1);
     g_signal_connect(level_combo, "changed", G_CALLBACK(on_level_changed), NULL);
     gtk_grid_attach(GTK_GRID(grid), level_combo, 0, 2, 1, 1);
@@ -496,7 +615,7 @@ int main(int argc, char *argv[])
     reduction_label = gtk_label_new("Redução estimada: N/A");
     gtk_grid_attach(GTK_GRID(grid), reduction_label, 1, 3, 1, 1);
 
-    compress_button = gtk_button_new_with_label("Compress PDF");
+    compress_button = gtk_button_new_with_label("Comprimir PDF");
     g_signal_connect(compress_button, "clicked", G_CALLBACK(on_compress_clicked), NULL);
     gtk_grid_attach(GTK_GRID(grid), compress_button, 0, 4, 1, 1);
 
