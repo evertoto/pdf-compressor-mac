@@ -1,20 +1,20 @@
-## Dependencies
+## Dependências
 
 ```bash
 brew install gtk+3
 brew install ghostscript
 ```
 
-## Deployment
+## Deploy
 
 ```bash
-cd /Users/everton/pdfcompressor
+cd pdfcompressor
 ./run.sh
 ```
 
-or:
+ou:
 
 ```bash
 make app
-open "/Users/everton/pdfcompressor/PDF Compressor.app"
+open "PDF Compressor.app"
 ```
