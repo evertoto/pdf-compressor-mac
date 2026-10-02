@@ -23,7 +23,7 @@ all: $(BIN)
 
 $(BIN): main.c
 	@echo "Compiling $(BIN)..."
-	@eval "$(CC) $(CFLAGS) -o $(BIN) main.c $(LIBS)"
+	$(CC) $(CFLAGS) -o $(BIN) main.c $(LIBS)
 
 app: $(BIN)
 	@echo "Building $(APP_NAME)..."
