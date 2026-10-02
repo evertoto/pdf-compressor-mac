@@ -1,11 +1,9 @@
-# Binaries and compiled artefacts
+
 pdfcompressor
 *.app
 
-# Build artefacts
 compressed/
 *.o
 *.tmp
 
-# macOS specific metadata
 .DS_Store

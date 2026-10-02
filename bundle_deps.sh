@@ -1,8 +1,3 @@
-# This script bundles the dynamic libraries needed by the binary into the
-# app bundle. It is optional – the app can be run directly from the build
-# directory without bundling if the required libraries are already available in
-# the system (e.g., when using Homebrew on macOS). The script is kept for users
-# who need a fully self‑contained .app.
 set -e
 
 APP_EXEC="$1"

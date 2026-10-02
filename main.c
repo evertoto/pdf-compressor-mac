@@ -37,32 +37,19 @@ static GtkWidget *compress_button;
 
 static char *selected_file = NULL;
 static long long selected_size = 0;
-static int selected_level = 1; // default medium
+static int selected_level = 1;
 static int estimation_id = 0;
 static gboolean compressing = FALSE;
 static gboolean shutting_down = FALSE;
 
-/* Order corresponds to UI labels: Baixa (low), Média (medium), Alta (high) */
 static const char *pdf_settings[3] = {"/screen", "/ebook", "/prepress"};
 
 static char *output_dir = NULL;
 
 extern char **environ;
 
-/*
- * Busca o executável Ghostscript (gs).
- *
- * Quando a aplicação é iniciada como um bundle macOS, o PATH padrão pode não
- * incluir o diretório onde o Homebrew instala o gs (/opt/homebrew/bin ou
- * /usr/local/bin). Esta função tenta localizar o executável nas seguintes fontes:
- *   1. O PATH corrente (g_find_program_in_path).
- *   2. Diretórios típicos de instalação do Homebrew.
- *   3. A Cellar do Homebrew, caso o gs tenha sido instalado em um sub‑diretório.
- * Se nenhum desses locais contiver um binário executável, a função devolve NULL.
- */
 static char *find_gs(void)
 {
-    /* 1. Busca no PATH corrente */
     gchar *found = g_find_program_in_path("gs");
     if (found) {
         if (access(found, X_OK) == 0) {
@@ -73,7 +60,6 @@ static char *find_gs(void)
         g_free(found);
     }
 
-    /* 2. Diretórios padrão do Homebrew */
     const char *candidates[] = {
         "/opt/homebrew/bin/gs",
         "/usr/local/bin/gs",
@@ -84,7 +70,6 @@ static char *find_gs(void)
         }
     }
 
-    /* 3. Busca na Cellar do Homebrew */
     glob_t gl;
     if (glob("/opt/homebrew/Cellar/ghostscript/*/bin/gs", 0, NULL, &gl) == 0 && gl.gl_pathc > 0) {
         const char *path = gl.gl_pathv[0];
@@ -106,9 +91,7 @@ static int run_gs(const char *gs_path,
                   char *errbuf,
                   size_t errbuf_size)
 {
-    /* Monta os parâmetros de forma idempotente – cada argumento é uma string
-     * independente, assim o posix_spawnp não tem que analisar espaços ou aspas.
-     */
+
     char setting_arg[256];
     snprintf(setting_arg, sizeof(setting_arg), "-dPDFSETTINGS=%s", setting);
     char output_arg[4096];
@@ -126,7 +109,6 @@ static int run_gs(const char *gs_path,
     argv[7] = (char *)input;
     argv[8] = NULL;
 
-    /* Captura stderr do Ghostscript para apresentar mensagens ao usuário. */
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         snprintf(errbuf, errbuf_size, "pipe failed: %s", strerror(errno));
@@ -136,11 +118,8 @@ static int run_gs(const char *gs_path,
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    /* Redireciona o descritor 2 (stderr) para o lado de escrita do pipe */
     posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
-    /* Fecha o lado de leitura no filho – ele não o usa */
     posix_spawn_file_actions_addclose(&actions, pipefd[0]);
-    /* Fecha o lado de escrita no filho após o dup2 */
     posix_spawn_file_actions_addclose(&actions, pipefd[1]);
 
     pid_t pid;
@@ -148,7 +127,7 @@ static int run_gs(const char *gs_path,
     int err = posix_spawnp(&pid, gs_path, &actions, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     free(argv);
-    close(pipefd[1]); /* Fechar escrita no processo pai */
+    close(pipefd[1]);
 
     if (err != 0) {
         snprintf(errbuf, errbuf_size, "Failed to start gs: %s", strerror(err));
@@ -156,7 +135,6 @@ static int run_gs(const char *gs_path,
         return -1;
     }
 
-    /* Lê a saída de erro completa do Ghostscript */
     ssize_t total = 0;
     while (total < (ssize_t)errbuf_size - 1) {
         ssize_t r = read(pipefd[0], errbuf + total, errbuf_size - 1 - total);
@@ -187,7 +165,6 @@ static int run_gs(const char *gs_path,
     return 0;
 }
 
-/* Helper that wraps find_gs + run_gs and returns a textual error if any */
 static int run_ghostscript(const char *input, const char *output, const char *setting, char **err_msg_out)
 {
     char *gs_path = find_gs();
@@ -503,27 +480,14 @@ static void on_select_file_clicked(GtkButton *button, gpointer user_data)
 
 int main(int argc, char *argv[])
 {
-    /* Determine a writable output directory.
-     *
-     * Quando o programa é iniciado a partir de um bundle macOS (.app) o diretório
-     * de trabalho pode ser "/" – o que faria "compressed" ser resolvido como
-     * "/compressed", diretório não gravável. Para evitar isso usamos o diretório
-     * onde o executável está localizado (argv[0]) como base, criando
-     * "<exe_dir>/compressed". Assim o caminho de saída funciona tanto em
-     * modo‑linha‑de‑comando quanto na interface gráfica empacotada.
-     */
-    /* Prefer a user‑writable directory (home) to evitar problemas ao escrever
-     * dentro do bundle da aplicação, que pode estar em /Applications e ser
-     * somente leitura. Usamos "$HOME/pdfcompressor/compressed" como local padrão.
-     */
+
     const char *home = g_get_home_dir();
     output_dir = g_build_filename(home, "pdfcompressor", "compressed", NULL);
     g_mkdir_with_parents(output_dir, 0755);
 
-    /* CLI mode: if an input file is supplied, compress directly and exit */
     if (argc > 1) {
         const char *input_path = argv[1];
-        int level = 1; // medium default
+        int level = 1;
         if (argc > 2 && strcmp(argv[2], "--level") == 0 && argc > 3) {
             const char *lvl = argv[3];
             if (strcmp(lvl, "low") == 0) level = 0;
@@ -535,7 +499,6 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Build output file name like the GUI
         char *basename = g_path_get_basename(input_path);
         char *name = NULL;
         if (g_str_has_suffix(basename, ".pdf")) {

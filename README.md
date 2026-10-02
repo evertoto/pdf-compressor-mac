@@ -7,8 +7,6 @@ brew install ghostscript
 
 ## Uso rápido (Linha de comando)
 
-Este projeto agora oferece um modo de linha de comando além da interface gráfica.
-
 ```bash
 ./pdfcompressor <arquivo.pdf> [--level low|medium|high]
 ```
